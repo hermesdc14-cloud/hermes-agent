@@ -90,6 +90,9 @@ def cron_list(show_all: bool = False):
         print(f"    Deliver:   {deliver_str}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
+        toolsets = job.get("toolsets") or []
+        if toolsets:
+            print(f"    Toolsets:  {', '.join(toolsets)}")
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")

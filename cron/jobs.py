@@ -62,6 +62,23 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def _normalize_toolset_list(toolsets: Optional[Any] = None) -> Optional[List[str]]:
+    """Normalize an optional toolset list while preserving order and uniqueness."""
+    if toolsets is None:
+        return None
+    if isinstance(toolsets, str):
+        raw_items = [toolsets]
+    else:
+        raw_items = list(toolsets)
+
+    normalized: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
@@ -428,6 +445,7 @@ def create_job(
     origin: Optional[Dict[str, Any]] = None,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
+    toolsets: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -448,6 +466,8 @@ def create_job(
         origin: Source info where job was created (for "origin" delivery)
         skill: Optional legacy single skill name to load before running the prompt
         skills: Optional ordered list of skills to load before running the prompt
+        toolsets: Optional ordered list of toolsets to enable for the cron run.
+            When omitted, cron keeps the default full tool availability.
         model: Optional per-job model override
         provider: Optional per-job provider override
         base_url: Optional per-job base URL override
@@ -488,6 +508,7 @@ def create_job(
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
+    normalized_toolsets = _normalize_toolset_list(toolsets)
     normalized_model = str(model).strip() if isinstance(model, str) else None
     normalized_provider = str(provider).strip() if isinstance(provider, str) else None
     normalized_base_url = str(base_url).strip().rstrip("/") if isinstance(base_url, str) else None
@@ -515,6 +536,7 @@ def create_job(
         "prompt": prompt,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
+        "toolsets": normalized_toolsets,
         "model": normalized_model,
         "provider": normalized_provider,
         "base_url": normalized_base_url,
@@ -856,17 +878,19 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     return due
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+def save_job_output(job_id: str, output: str, telemetry: Optional[Dict[str, Any]] = None):
+    """Save job output to markdown and optionally write a JSON telemetry sidecar."""
     ensure_dirs()
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
+
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+    telemetry_file = job_output_dir / f"{timestamp}.json"
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
+    tmp_sidecar_path = None
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(output)
@@ -874,13 +898,28 @@ def save_job_output(job_id: str, output: str):
             os.fsync(f.fileno())
         atomic_replace(tmp_path, output_file)
         _secure_file(output_file)
+
+        if telemetry is not None:
+            sidecar_fd, tmp_sidecar_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.telemetry_')
+            with os.fdopen(sidecar_fd, 'w', encoding='utf-8') as f:
+                json.dump(telemetry, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_sidecar_path, telemetry_file)
+            _secure_file(telemetry_file)
+            tmp_sidecar_path = None
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        if tmp_sidecar_path:
+            try:
+                os.unlink(tmp_sidecar_path)
+            except OSError:
+                pass
         raise
-    
+
     return output_file
 
 

@@ -427,6 +427,34 @@ class TestBuildSkillsSystemPrompt:
 
         result = build_skills_system_prompt()
         assert "backend-skill" in result
+    def test_compacts_large_category_listing(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools"
+        skills_dir.mkdir(parents=True)
+        for idx in range(6):
+            skill_dir = skills_dir / f"skill-{idx}"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: skill-{idx}\ndescription: Description for skill {idx} that is intentionally verbose enough to be trimmed in the prompt index.\n---\n"
+            )
+
+        result = build_skills_system_prompt()
+        assert result.count("    - skill-") == 4
+        assert "+2 more" in result
+        assert "skills_list()" in result
+
+    def test_trims_long_descriptions_in_index(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools" / "verbose-skill"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: verbose-skill\ndescription: This description is intentionally very long so the system prompt index trims it before caching and injection into the main prompt payload.\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+        assert "verbose-skill" in result
+        assert "main prompt payload" not in result
+        assert "…" in result
 
 
 class TestBuildNousSubscriptionPrompt:

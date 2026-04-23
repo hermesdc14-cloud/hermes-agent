@@ -121,7 +121,11 @@ from tools.terminal_tool import (
     _get_approval_callback,
     _get_sudo_password_callback,
 )
-from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
+from tools.tool_result_storage import (
+    PERSISTED_OUTPUT_TAG,
+    maybe_persist_tool_result,
+    enforce_turn_budget,
+)
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
@@ -948,6 +952,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        skip_skills_system_prompt: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -1029,6 +1034,8 @@ class AIAgent:
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
+        self.load_soul_identity = load_soul_identity
+        self.skip_skills_system_prompt = skip_skills_system_prompt
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
         self._credential_pool = credential_pool
@@ -1253,6 +1260,15 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+        self._token_telemetry: Dict[str, Any] = {
+            "system_prompt": {},
+            "last_request": {},
+            "session": {
+                "tool_result_chars_raw": 0,
+                "tool_result_chars_inline": 0,
+                "tool_results_saved_to_file": 0,
+            },
+        }
 
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
@@ -4598,6 +4614,51 @@ class AIAgent:
             "budget_max": self.iteration_budget.max_total,
         }
 
+    def _record_tool_turn_telemetry(self, raw_lengths: list[int], tool_messages: list[dict]) -> None:
+        """Accumulate raw vs inline tool-result sizes for the current session."""
+        if not raw_lengths or not tool_messages:
+            return
+        session_meta = self._token_telemetry.setdefault("session", {})
+        session_meta["tool_result_chars_raw"] = session_meta.get("tool_result_chars_raw", 0) + sum(raw_lengths)
+        session_meta["tool_result_chars_inline"] = session_meta.get("tool_result_chars_inline", 0) + sum(
+            len(str(msg.get("content", ""))) for msg in tool_messages
+        )
+        session_meta["tool_results_saved_to_file"] = session_meta.get("tool_results_saved_to_file", 0) + sum(
+            1 for msg in tool_messages if PERSISTED_OUTPUT_TAG in str(msg.get("content", ""))
+        )
+
+    def _record_last_request_telemetry(self, api_messages: list[dict], effective_system: str, compression_count: int) -> None:
+        """Store rough request-composition telemetry for audits and cron sidecars."""
+        request_messages = api_messages
+        if request_messages and request_messages[0].get("role") == "system":
+            request_messages = request_messages[1:]
+        tool_schema = self.tools or []
+        try:
+            tool_schema_json = json.dumps(tool_schema, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            tool_schema_json = ""
+        self._token_telemetry["last_request"] = {
+            "request_tokens_est": estimate_request_tokens_rough(
+                request_messages,
+                system_prompt=effective_system or "",
+                tools=tool_schema or None,
+            ),
+            "system_prompt_chars": len(effective_system or ""),
+            "system_prompt_tokens_est": estimate_tokens_rough(effective_system or ""),
+            "prefill_tokens_est": estimate_messages_tokens_rough(self.prefill_messages or []),
+            "message_tokens_est": estimate_messages_tokens_rough(request_messages),
+            "tool_schema_chars": len(tool_schema_json),
+            "tool_schema_tokens_est": estimate_tokens_rough(tool_schema_json) if tool_schema_json else 0,
+            "message_count": len(request_messages),
+            "tool_count": len(tool_schema),
+            "compression_count": compression_count,
+            "prompt_caching_enabled": bool(self._use_prompt_caching),
+        }
+
+    def get_token_telemetry(self) -> dict:
+        """Return a copy of lightweight token-related telemetry for diagnostics."""
+        return copy.deepcopy(self._token_telemetry)
+
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
 
@@ -4852,6 +4913,16 @@ class AIAgent:
         #   6. Current date & time (frozen at build time)
         #   7. Platform-specific formatting hint
 
+        prompt_parts: list[str] = []
+        prompt_components: list[tuple[str, str]] = []
+
+        def _append_part(name: str, content: Optional[str]) -> None:
+            text = str(content or "").strip()
+            if not text:
+                return
+            prompt_parts.append(text)
+            prompt_components.append((name, text))
+
         # Try SOUL.md as primary identity unless the caller explicitly skipped it.
         # Some execution modes (cron) still want HERMES_HOME persona while keeping
         # cwd project instructions disabled.
@@ -4859,12 +4930,12 @@ class AIAgent:
         if self.load_soul_identity or not self.skip_context_files:
             _soul_content = load_soul_md()
             if _soul_content:
-                prompt_parts = [_soul_content]
+                _append_part("identity", _soul_content)
                 _soul_loaded = True
 
         if not _soul_loaded:
             # Fallback to hardcoded identity
-            prompt_parts = [DEFAULT_AGENT_IDENTITY]
+            _append_part("identity", DEFAULT_AGENT_IDENTITY)
 
         # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
         prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -4884,11 +4955,11 @@ class AIAgent:
         if "kanban_show" in self.valid_tool_names:
             tool_guidance.append(KANBAN_GUIDANCE)
         if tool_guidance:
-            prompt_parts.append(" ".join(tool_guidance))
+            _append_part("tool_guidance", " ".join(tool_guidance))
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
-            prompt_parts.append(nous_subscription_prompt)
+            _append_part("nous_subscription", nous_subscription_prompt)
         # Tool-use enforcement: tells the model to actually call tools instead
         # of describing intended actions.  Controlled by config.yaml
         # agent.tool_use_enforcement:
@@ -4911,46 +4982,46 @@ class AIAgent:
                 model_lower = (self.model or "").lower()
                 _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
             if _inject:
-                prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+                _append_part("tool_use_enforcement", TOOL_USE_ENFORCEMENT_GUIDANCE)
                 _model_lower = (self.model or "").lower()
                 # Google model operational guidance (conciseness, absolute
                 # paths, parallel tool calls, verify-before-edit, etc.)
                 if "gemini" in _model_lower or "gemma" in _model_lower:
-                    prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
+                    _append_part("google_operational_guidance", GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
                 # OpenAI GPT/Codex execution discipline (tool persistence,
                 # prerequisite checks, verification, anti-hallucination).
                 if "gpt" in _model_lower or "codex" in _model_lower:
-                    prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+                    _append_part("openai_execution_guidance", OPENAI_MODEL_EXECUTION_GUIDANCE)
 
         # so it can refer the user to them rather than reinventing answers.
 
         # Note: ephemeral_system_prompt is NOT included here. It's injected at
         # API-call time only so it stays out of the cached/stored system prompt.
         if system_message is not None:
-            prompt_parts.append(system_message)
+            _append_part("system_message", system_message)
 
         if self._memory_store:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
-                    prompt_parts.append(mem_block)
+                    _append_part("memory", mem_block)
             # USER.md is always included when enabled.
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
-                    prompt_parts.append(user_block)
+                    _append_part("user_profile", user_block)
 
         # External memory provider system prompt block (additive to built-in)
         if self._memory_manager:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
-                    prompt_parts.append(_ext_mem_block)
+                    _append_part("external_memory", _ext_mem_block)
             except Exception:
                 pass
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-        if has_skills_tools:
+        if has_skills_tools and not self.skip_skills_system_prompt:
             avail_toolsets = {
                 toolset
                 for toolset in (
@@ -4965,7 +5036,7 @@ class AIAgent:
         else:
             skills_prompt = ""
         if skills_prompt:
-            prompt_parts.append(skills_prompt)
+            _append_part("skills", skills_prompt)
 
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway
@@ -4976,7 +5047,7 @@ class AIAgent:
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
-                prompt_parts.append(context_files_prompt)
+                _append_part("context_files", context_files_prompt)
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
@@ -4987,40 +5058,53 @@ class AIAgent:
             timestamp_line += f"\nModel: {self.model}"
         if self.provider:
             timestamp_line += f"\nProvider: {self.provider}"
-        prompt_parts.append(timestamp_line)
+        _append_part("timestamp", timestamp_line)
 
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt
         # so the agent can correctly report which model it is (workaround for API bug).
         if self.provider == "alibaba":
             _model_short = self.model.split("/")[-1] if "/" in self.model else self.model
-            prompt_parts.append(
+            _append_part(
+                "provider_identity",
                 f"You are powered by the model named {_model_short}. "
                 f"The exact model ID is {self.model}. "
                 f"When asked what model you are, always answer based on this information, "
-                f"not on any model name returned by the API."
+                f"not on any model name returned by the API.",
             )
 
         # Environment hints (WSL, Termux, etc.) — tell the agent about the
         # execution environment so it can translate paths and adapt behavior.
         _env_hints = build_environment_hints()
         if _env_hints:
-            prompt_parts.append(_env_hints)
+            _append_part("environment_hints", _env_hints)
 
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
-            prompt_parts.append(PLATFORM_HINTS[platform_key])
+            _append_part("platform_hint", PLATFORM_HINTS[platform_key])
         elif platform_key:
             # Check plugin registry for platform-specific LLM guidance
             try:
                 from gateway.platform_registry import platform_registry
                 _entry = platform_registry.get(platform_key)
                 if _entry and _entry.platform_hint:
-                    prompt_parts.append(_entry.platform_hint)
+                    _append_part("platform_hint", _entry.platform_hint)
             except Exception:
                 pass
 
-        return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+        final_prompt = "\n\n".join(prompt_parts)
+        component_chars = {name: len(content) for name, content in prompt_components}
+        self._token_telemetry["system_prompt"] = {
+            "component_chars": component_chars,
+            "component_tokens_est": {
+                name: estimate_tokens_rough(content) for name, content in prompt_components
+            },
+            "total_chars": len(final_prompt),
+            "total_tokens_est": estimate_tokens_rough(final_prompt),
+            "skills_chars": component_chars.get("skills", 0),
+            "skip_skills_system_prompt": bool(self.skip_skills_system_prompt),
+        }
+        return final_prompt
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -9655,6 +9739,7 @@ class AIAgent:
                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
         # ── Post-execution: display per-tool results ─────────────────────
+        turn_tool_raw_lengths: list[int] = []
         for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
             r = results[i]
             blocked = False
@@ -9714,6 +9799,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
+            turn_tool_raw_lengths.append(len(function_result))
             function_result = maybe_persist_tool_result(
                 content=function_result,
                 tool_name=name,
@@ -9749,9 +9835,11 @@ class AIAgent:
         # so the steer marker is never truncated. See steer() for details.
         if num_tools > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools)
+            self._record_tool_turn_telemetry(turn_tool_raw_lengths, messages[-num_tools:])
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+        turn_tool_raw_lengths: list[int] = []
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
             # SAFETY: check interrupt BEFORE starting each tool.
             # If the user sent "stop" during a previous tool's execution,
@@ -10100,6 +10188,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
+            turn_tool_raw_lengths.append(len(function_result))
             function_result = maybe_persist_tool_result(
                 content=function_result,
                 tool_name=function_name,
@@ -10159,6 +10248,7 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+            self._record_tool_turn_telemetry(turn_tool_raw_lengths, messages[-num_tools_seq:])
 
 
 
@@ -10986,6 +11076,7 @@ class AIAgent:
             # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
             # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
             _sanitize_messages_surrogates(api_messages)
+            self._record_last_request_telemetry(api_messages, effective_system, compression_attempts)
 
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)

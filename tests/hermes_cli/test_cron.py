@@ -1,12 +1,11 @@
 """Tests for hermes_cli.cron command handling."""
-
+from pathlib import Path
 from argparse import Namespace
 
 import pytest
 
-from cron.jobs import create_job, get_job, list_jobs
+from cron.jobs import create_job, get_job, list_jobs, save_job_output
 from hermes_cli.cron import cron_command
-
 
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
@@ -105,3 +104,25 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_create_job_persists_toolsets(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Audit local state",
+            schedule="every 1h",
+            toolsets=["terminal", "file", "code_execution"],
+        )
+
+        stored = get_job(job["id"])
+        assert stored["toolsets"] == ["terminal", "file", "code_execution"]
+
+    def test_save_job_output_writes_json_sidecar(self, tmp_cron_dir):
+        output_path = save_job_output(
+            "job123",
+            "# Report\n\nhello",
+            telemetry={"last_request": {"request_tokens_est": 1234}},
+        )
+
+        sidecar = Path(str(output_path).replace(".md", ".json"))
+        assert output_path.exists()
+        assert sidecar.exists()
+        assert '1234' in sidecar.read_text(encoding='utf-8')

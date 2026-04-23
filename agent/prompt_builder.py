@@ -709,6 +709,21 @@ def _skill_should_show(
     return True
 
 
+_SKILLS_PROMPT_MAX_SKILLS_PER_CATEGORY = 4
+_SKILLS_PROMPT_DESCRIPTION_MAX_CHARS = 56
+
+
+def _trim_skill_description(desc: str, max_chars: int = _SKILLS_PROMPT_DESCRIPTION_MAX_CHARS) -> str:
+    """Trim verbose skill descriptions so the skills index stays cache-friendly."""
+    text = str(desc or "").strip()
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[: max_chars - 1].rstrip()
+    if " " in trimmed:
+        trimmed = trimmed.rsplit(" ", 1)[0]
+    return trimmed.rstrip(" ,;:-") + "…"
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -890,19 +905,31 @@ def build_skills_system_prompt(
         for category in sorted(skills_by_category.keys()):
             cat_desc = category_descriptions.get(category, "")
             if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
+                index_lines.append(f"  {category}: {_trim_skill_description(cat_desc)}")
             else:
                 index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
+            # Deduplicate and sort skills within each category, then cap how many
+            # full entries we inline so large local catalogs don't dominate the prompt.
             seen = set()
+            unique_skills: list[tuple[str, str]] = []
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                unique_skills.append((name, desc))
+
+            visible_skills = unique_skills[:_SKILLS_PROMPT_MAX_SKILLS_PER_CATEGORY]
+            hidden_count = max(0, len(unique_skills) - len(visible_skills))
+            for name, desc in visible_skills:
+                trimmed_desc = _trim_skill_description(desc)
+                if trimmed_desc:
+                    index_lines.append(f"    - {name}: {trimmed_desc}")
                 else:
                     index_lines.append(f"    - {name}")
+            if hidden_count:
+                index_lines.append(
+                    f"    - +{hidden_count} more — call skills_list() if you need the full category listing"
+                )
 
         result = (
             "## Skills (mandatory)\n"

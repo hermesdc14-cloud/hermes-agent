@@ -836,7 +836,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
-            return True, silent_doc, SILENT_MARKER, None
+            return True, silent_doc, SILENT_MARKER, None, {"wake_gate": False}
 
     prompt = _build_job_prompt(job, prerun_script=prerun_script)
     origin = _resolve_origin(job)
@@ -894,6 +894,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
     try:
+        agent = None
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
@@ -964,6 +965,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Max iterations
         max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        job_toolsets = job.get("toolsets") if isinstance(job.get("toolsets"), list) else None
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
@@ -1041,7 +1043,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=job_toolsets or _resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
@@ -1051,6 +1053,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_skills_system_prompt=True,  # Attached skills are already injected into the job prompt; skip the global catalog tax.
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -1172,7 +1175,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+        telemetry = agent.get_token_telemetry() if agent and hasattr(agent, "get_token_telemetry") else {}
+        telemetry_block = ""
+        if telemetry:
+            telemetry_block = (
+                "\n## Telemetry\n\n"
+                "```json\n"
+                f"{json.dumps(telemetry, indent=2, ensure_ascii=False)}\n"
+                "```\n"
+            )
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -1186,10 +1198,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 ## Response
 
 {logged_response}
-"""
-        
+{telemetry_block}"""
+
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        return True, output, final_response, None, telemetry
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -1211,7 +1223,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
-        return False, output, "", error_msg
+        telemetry = agent.get_token_telemetry() if agent and hasattr(agent, "get_token_telemetry") else {}
+        return False, output, "", error_msg, telemetry
 
     finally:
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
@@ -1331,9 +1344,9 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
-                success, output, final_response, error = run_job(job)
+                success, output, final_response, error, telemetry = run_job(job)
 
-                output_file = save_job_output(job["id"], output)
+                output_file = save_job_output(job["id"], output, telemetry=telemetry)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 

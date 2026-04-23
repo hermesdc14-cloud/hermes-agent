@@ -114,6 +114,22 @@ def _canonical_skills(skill: Optional[str] = None, skills: Optional[Any] = None)
     return normalized
 
 
+def _canonical_toolsets(toolsets: Optional[Any] = None) -> Optional[List[str]]:
+    if toolsets is None:
+        return None
+    if isinstance(toolsets, str):
+        raw_items = [toolsets]
+    else:
+        raw_items = list(toolsets)
+
+    normalized: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
 
 
 def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
@@ -218,6 +234,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "name": job["name"],
         "skill": skills[0] if skills else None,
         "skills": skills,
+        "toolsets": job.get("toolsets"),
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
         "model": job.get("model"),
         "provider": job.get("provider"),
@@ -254,6 +271,7 @@ def cronjob(
     include_disabled: bool = False,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
+    toolsets: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -274,6 +292,7 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
+            canonical_toolsets = _canonical_toolsets(toolsets)
             if not prompt and not canonical_skills:
                 return tool_error("create requires either prompt or at least one skill", success=False)
             if prompt:
@@ -307,6 +326,7 @@ def cronjob(
                 deliver=_normalize_deliver_param(deliver),
                 origin=_origin_from_env(),
                 skills=canonical_skills,
+                toolsets=canonical_toolsets,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
@@ -390,6 +410,8 @@ def cronjob(
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
+            if toolsets is not None:
+                updates["toolsets"] = _canonical_toolsets(toolsets)
             if model is not None:
                 updates["model"] = _normalize_optional_job_value(model)
             if provider is not None:
@@ -507,6 +529,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
             },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional ordered list of toolsets to enable for this cron job. Use this to keep scheduled jobs on a slim tool profile. On update, pass an empty array to allow a tools-free run or omit the field to keep the existing setting."
+            },
             "model": {
                 "type": "object",
                 "description": "Optional per-job model override. If provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
@@ -587,6 +614,7 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
+        toolsets=args.get("toolsets"),
         model=_mo[1],
         provider=_mo[0] or args.get("provider"),
         base_url=args.get("base_url"),
