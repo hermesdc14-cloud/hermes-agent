@@ -219,3 +219,47 @@ def test_new_session_resets_token_counters(tmp_path):
     assert comp.last_total_tokens == 0
     assert comp.compression_count == 0
     assert comp._context_probed is False
+
+
+def test_cli_auto_rotates_oversized_session_on_message_count(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    cli.conversation_history = [
+        {"role": "user", "content": f"msg {i}"} for i in range(130)
+    ]
+
+    reason = cli._auto_rotate_oversized_session_if_needed()
+
+    assert reason == "message_count"
+    assert cli.session_id != old_session_id
+    assert cli.conversation_history == []
+    assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
+    assert cli._session_db.get_session(cli.session_id) is not None
+
+
+def test_cli_auto_rotates_oversized_session_on_prompt_tokens(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    cli.conversation_history = [{"role": "user", "content": "hello"}]
+    cli.agent.session_prompt_tokens = 95_000
+
+    reason = cli._auto_rotate_oversized_session_if_needed()
+
+    assert reason == "prompt_tokens"
+    assert cli.session_id != old_session_id
+    assert cli.conversation_history == []
+    assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
+    assert cli._session_db.get_session(cli.session_id) is not None
+
+
+def test_cli_does_not_rotate_small_session(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    cli.conversation_history = [{"role": "user", "content": "hello"}]
+    cli.agent.session_prompt_tokens = 1_000
+
+    reason = cli._auto_rotate_oversized_session_if_needed()
+
+    assert reason is None
+    assert cli.session_id == old_session_id
+    assert cli.conversation_history == [{"role": "user", "content": "hello"}]

@@ -75,6 +75,9 @@ from hermes_cli.banner import _format_context_length, format_banner_version_labe
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
+_CLI_SESSION_SPRAWL_MSG_LIMIT = 120
+_CLI_SESSION_SPRAWL_TOKEN_LIMIT = 90_000
+
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -4936,6 +4939,63 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _auto_rotate_oversized_session_if_needed(self) -> Optional[str]:
+        """Start a fresh CLI session when the current one becomes a token sink.
+
+        Returns:
+            "message_count" when rotation was triggered by transcript size,
+            "prompt_tokens" when triggered by prompt footprint, or None.
+        """
+        if not self.agent or not self.conversation_history:
+            return None
+
+        try:
+            msg_limit = int(
+                os.getenv(
+                    "HERMES_CLI_SESSION_SPRAWL_MSG_LIMIT",
+                    str(_CLI_SESSION_SPRAWL_MSG_LIMIT),
+                )
+            )
+        except (TypeError, ValueError):
+            msg_limit = _CLI_SESSION_SPRAWL_MSG_LIMIT
+        try:
+            token_limit = int(
+                os.getenv(
+                    "HERMES_CLI_SESSION_SPRAWL_TOKEN_LIMIT",
+                    str(_CLI_SESSION_SPRAWL_TOKEN_LIMIT),
+                )
+            )
+        except (TypeError, ValueError):
+            token_limit = _CLI_SESSION_SPRAWL_TOKEN_LIMIT
+
+        history_count = len(self.conversation_history)
+        prompt_tokens = max(
+            int(getattr(getattr(self.agent, "context_compressor", None), "last_prompt_tokens", 0) or 0),
+            int(getattr(self.agent, "session_prompt_tokens", 0) or 0),
+        )
+
+        reason = None
+        if history_count >= max(msg_limit, 1):
+            reason = "message_count"
+        elif prompt_tokens >= max(token_limit, 1):
+            reason = "prompt_tokens"
+
+        if reason is None:
+            return None
+
+        old_session_id = self.session_id
+        self.new_session(silent=True)
+        trigger_text = (
+            f"thread hit {history_count} messages"
+            if reason == "message_count"
+            else f"prompt footprint reached ~{prompt_tokens:,} tokens"
+        )
+        _cprint(
+            "  ↻ Auto-rotated session to stop carry-forward token waste "
+            f"({trigger_text}). Use /resume {old_session_id} to reopen the previous lane."
+        )
+        return reason
+
     def new_session(self, silent=False):
         """Start a fresh session with a new session ID and cleared agent state."""
         if self.agent and self.conversation_history:
@@ -9136,6 +9196,8 @@ class HermesCLI:
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        self._auto_rotate_oversized_session_if_needed()
 
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
