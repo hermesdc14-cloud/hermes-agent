@@ -849,3 +849,181 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     assert FakeCompressAgent.last_instance is None, (
         "Compression should NOT fire at 12 messages with default hard_limit=400"
     )
+
+
+@pytest.mark.asyncio
+async def test_oversized_session_auto_rotates_before_agent_run(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = HygieneCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    old_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:123",
+        session_id="sess-old",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        last_prompt_tokens=10_000,
+    )
+    new_entry = SessionEntry(
+        session_key=old_entry.session_key,
+        session_id="sess-new",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.config = runner.config
+    runner.session_store.get_or_create_session.return_value = old_entry
+    runner.session_store.load_transcript.return_value = _make_history(130, content_size=20)
+    runner.session_store.reset_session.return_value = new_entry
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._format_session_info = lambda: ""
+    runner._bind_adapter_run_generation = lambda *_args, **_kwargs: None
+    runner._is_session_run_current = lambda *_args, **_kwargs: True
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._clear_session_env = lambda _tokens: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION_SPRAWL_MSG_LIMIT", "120")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION_SPRAWL_TOKEN_LIMIT", "90000")
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="u1",
+            user_name="tester",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message_with_agent(event, event.source, "quick-key", 1)
+
+    assert result == "ok"
+    runner.session_store.reset_session.assert_called_once_with(old_entry.session_key)
+    assert runner._run_agent.await_args.kwargs["history"] == []
+    assert any("automatically reset" in msg["content"] for msg in adapter.sent)
+    assert any("too large" in msg["content"] for msg in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_oversized_session_auto_rotates_on_prompt_tokens(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = HygieneCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    old_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:123",
+        session_id="sess-old",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        last_prompt_tokens=95_000,
+    )
+    new_entry = SessionEntry(
+        session_key=old_entry.session_key,
+        session_id="sess-new",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.config = runner.config
+    runner.session_store.get_or_create_session.return_value = old_entry
+    runner.session_store.load_transcript.return_value = _make_history(10, content_size=20)
+    runner.session_store.reset_session.return_value = new_entry
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._format_session_info = lambda: ""
+    runner._bind_adapter_run_generation = lambda *_args, **_kwargs: None
+    runner._is_session_run_current = lambda *_args, **_kwargs: True
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._clear_session_env = lambda _tokens: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION_SPRAWL_MSG_LIMIT", "120")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION_SPRAWL_TOKEN_LIMIT", "90000")
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="u1",
+            user_name="tester",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message_with_agent(event, event.source, "quick-key", 1)
+
+    assert result == "ok"
+    runner.session_store.reset_session.assert_called_once_with(old_entry.session_key)
+    assert runner._run_agent.await_args.kwargs["history"] == []

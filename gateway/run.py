@@ -48,6 +48,8 @@ from hermes_cli.config import cfg_get
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+_SESSION_SPRAWL_MSG_LIMIT = 120
+_SESSION_SPRAWL_TOKEN_LIMIT = 90000
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
 # Stale tool-tail/resume markers can otherwise revive an unrelated old task
@@ -89,7 +91,6 @@ _STALE_CODE_SENTINELS: tuple[str, ...] = (
     "gateway/run.py",
     "pyproject.toml",
 )
-
 
 def _compute_repo_mtime(repo_root: Path) -> float:
     """Return the newest mtime across the stale-code sentinel files.
@@ -230,7 +231,6 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
         # Returning None lets the caller fall through to the legacy-fresh path.
         return None
     return None
-
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -5604,6 +5604,27 @@ class GatewayRunner:
             source.chat_id or "unknown", _msg_preview,
         )
 
+        def _session_sprawl_limits() -> tuple[int, int]:
+            try:
+                msg_limit = int(
+                    os.getenv(
+                        "HERMES_GATEWAY_SESSION_SPRAWL_MSG_LIMIT",
+                        str(_SESSION_SPRAWL_MSG_LIMIT),
+                    )
+                )
+            except (TypeError, ValueError):
+                msg_limit = _SESSION_SPRAWL_MSG_LIMIT
+            try:
+                token_limit = int(
+                    os.getenv(
+                        "HERMES_GATEWAY_SESSION_SPRAWL_TOKEN_LIMIT",
+                        str(_SESSION_SPRAWL_TOKEN_LIMIT),
+                    )
+                )
+            except (TypeError, ValueError):
+                token_limit = _SESSION_SPRAWL_TOKEN_LIMIT
+            return max(msg_limit, 1), max(token_limit, 1)
+
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -5616,6 +5637,42 @@ class GatewayRunner:
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
+        history = self.session_store.load_transcript(session_entry.session_id)
+
+        # Hard session-sprawl reset: giant messaging threads can stay below the
+        # model's hard context limit while still wasting tokens every turn by
+        # carrying unrelated work forward forever. Rotate to a fresh session
+        # once the transcript crosses a practical budget; the old session stays
+        # available via /resume instead of taxing every new request.
+        if history and source.platform != Platform.WEBHOOK:
+            from agent.model_metadata import estimate_messages_tokens_rough
+
+            _sprawl_msg_limit, _sprawl_token_limit = _session_sprawl_limits()
+            _history_count = len(history)
+            _history_tokens = (
+                session_entry.last_prompt_tokens
+                or estimate_messages_tokens_rough(history)
+            )
+            if (
+                _history_count >= _sprawl_msg_limit
+                or _history_tokens >= _sprawl_token_limit
+            ):
+                logger.info(
+                    "Session sprawl: rotating %s (%s messages, ~%s prompt tokens; limits: %s msgs / %s tokens)",
+                    session_key,
+                    _history_count,
+                    f"{_history_tokens:,}",
+                    _sprawl_msg_limit,
+                    f"{_sprawl_token_limit:,}",
+                )
+                _rotated_entry = self.session_store.reset_session(session_key)
+                if _rotated_entry is not None:
+                    session_entry = _rotated_entry
+                    session_key = session_entry.session_key
+                    history = []
+                    session_entry.was_auto_reset = True
+                    session_entry.auto_reset_reason = "oversized"
+                    session_entry.reset_had_activity = True
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -5660,6 +5717,8 @@ class GatewayRunner:
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
+            elif reset_reason == "oversized":
+                context_note = "[System note: The user's previous session was automatically rotated because the thread had grown too large and wasteful to keep carrying forward. This is a fresh conversation with no prior context. The old session remains available via /resume.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
             context_prompt = context_note + "\n\n" + context_prompt
@@ -5677,7 +5736,7 @@ class GatewayRunner:
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
                 # Suspended sessions always notify (they were explicitly stopped
                 # or crashed mid-operation) — skip the policy check.
-                should_notify = reset_reason == "suspended" or (
+                should_notify = reset_reason in {"suspended", "oversized"} or (
                     policy.notify
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
@@ -5689,6 +5748,8 @@ class GatewayRunner:
                             reason_text = "previous session was stopped or interrupted"
                         elif reset_reason == "daily":
                             reason_text = f"daily schedule at {policy.at_hour}:00"
+                        elif reset_reason == "oversized":
+                            reason_text = "thread had grown too large to keep carrying forward efficiently"
                         else:
                             hours = policy.idle_minutes // 60
                             mins = policy.idle_minutes % 60
@@ -5752,9 +5813,6 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
-        
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
