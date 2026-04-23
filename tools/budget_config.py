@@ -13,11 +13,13 @@ PINNED_THRESHOLDS: Dict[str, float] = {
     "read_file": float("inf"),
 }
 
-# Defaults matching the current hardcoded values in tool_result_storage.py.
-# Kept here as the single source of truth; tool_result_storage.py imports these.
-DEFAULT_RESULT_SIZE_CHARS: int = 100_000
-DEFAULT_TURN_BUDGET_CHARS: int = 200_000
-DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
+# Defaults tuned for lower transcript carry-forward in real agent sessions.
+# 20K-char single results and 40K-char per-turn aggregate are aggressive by
+# design: enough for useful previews, but low enough to push large terminal,
+# search, and execute_code dumps out of the replayed transcript quickly.
+DEFAULT_RESULT_SIZE_CHARS: int = 20000
+DEFAULT_TURN_BUDGET_CHARS: int = 40000
+DEFAULT_PREVIEW_SIZE_CHARS: int = 600
 
 
 @dataclass(frozen=True)
