@@ -5667,9 +5667,27 @@ class GatewayRunner:
                 )
                 _rotated_entry = self.session_store.reset_session(session_key)
                 if _rotated_entry is not None:
+                    _carry_summary = await self._build_rotation_summary(
+                        history,
+                        source=source,
+                        session_entry=session_entry,
+                    )
                     session_entry = _rotated_entry
                     session_key = session_entry.session_key
-                    history = []
+                    history = (
+                        [{"role": "assistant", "content": _carry_summary}]
+                        if _carry_summary
+                        else []
+                    )
+                    if history:
+                        self.session_store.rewrite_transcript(
+                            session_entry.session_id,
+                            history,
+                        )
+                        self.session_store.update_session(
+                            session_entry.session_key,
+                            last_prompt_tokens=0,
+                        )
                     session_entry.was_auto_reset = True
                     session_entry.auto_reset_reason = "oversized"
                     session_entry.reset_had_activity = True
@@ -6726,6 +6744,55 @@ class GatewayRunner:
             lines.append(f"◆ Endpoint: {base_url}")
 
         return "\n".join(lines)
+
+    async def _build_rotation_summary(
+        self,
+        history: list[dict],
+        *,
+        source: SessionSource,
+        session_entry: Any,
+        user_config: Optional[dict] = None,
+    ) -> str:
+        """Build a compact carry-forward summary for an auto-rotated gateway session."""
+        if not history:
+            return ""
+
+        try:
+            from run_agent import AIAgent
+
+            model, runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_entry.session_key,
+                user_config=user_config if isinstance(user_config, dict) else None,
+            )
+            tmp_agent = AIAgent(
+                **runtime,
+                model=model,
+                max_iterations=1,
+                quiet_mode=True,
+                skip_memory=True,
+                enabled_toolsets=["memory"],
+                session_id=session_entry.session_id,
+            )
+            try:
+                tmp_agent._print_fn = lambda *a, **kw: None
+                loop = asyncio.get_running_loop()
+                summary = await loop.run_in_executor(
+                    None,
+                    lambda: tmp_agent.context_compressor._generate_summary(history),
+                )
+                if summary:
+                    return summary
+            finally:
+                self._cleanup_agent_resources(tmp_agent)
+        except Exception:
+            pass
+
+        return (
+            "[CONTEXT COMPACTION — REFERENCE ONLY]\n"
+            "Previous messaging session was auto-rotated to control token growth. "
+            "Use /resume to reopen the previous lane if more detail is needed."
+        )
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""

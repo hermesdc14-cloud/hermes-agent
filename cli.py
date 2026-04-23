@@ -4939,6 +4939,26 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _build_rotation_summary(self, history: List[Dict[str, Any]]) -> str:
+        """Build a compact carry-forward summary for an auto-rotated CLI session."""
+        if not history:
+            return ""
+
+        compressor = getattr(self.agent, "context_compressor", None)
+        if compressor is not None:
+            try:
+                summary = compressor._generate_summary(history)
+                if summary:
+                    return summary
+            except Exception:
+                pass
+
+        return (
+            "[CONTEXT COMPACTION — REFERENCE ONLY]\n"
+            "Previous CLI session was auto-rotated to control token growth. "
+            "Use /resume to inspect the old lane if more detail is needed."
+        )
+
     def _auto_rotate_oversized_session_if_needed(self) -> Optional[str]:
         """Start a fresh CLI session when the current one becomes a token sink.
 
@@ -4983,8 +5003,21 @@ class HermesCLI:
         if reason is None:
             return None
 
+        carry_summary = self._build_rotation_summary(self.conversation_history)
         old_session_id = self.session_id
         self.new_session(silent=True)
+        if carry_summary:
+            summary_message = {"role": "assistant", "content": carry_summary}
+            self.conversation_history = [summary_message]
+            if self._session_db:
+                try:
+                    self._session_db.append_message(
+                        self.session_id,
+                        role="assistant",
+                        content=carry_summary,
+                    )
+                except Exception:
+                    pass
         trigger_text = (
             f"thread hit {history_count} messages"
             if reason == "message_count"

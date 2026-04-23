@@ -905,6 +905,9 @@ async def test_oversized_session_auto_rotates_before_agent_run(monkeypatch, tmp_
     runner._is_session_run_current = lambda *_args, **_kwargs: True
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._clear_session_env = lambda _tokens: None
+    runner._build_rotation_summary = AsyncMock(
+        return_value="[CONTEXT COMPACTION — REFERENCE ONLY]\ncarry forward"
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -936,7 +939,9 @@ async def test_oversized_session_auto_rotates_before_agent_run(monkeypatch, tmp_
 
     assert result == "ok"
     runner.session_store.reset_session.assert_called_once_with(old_entry.session_key)
-    assert runner._run_agent.await_args.kwargs["history"] == []
+    assert runner._run_agent.await_args.kwargs["history"] == [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION — REFERENCE ONLY]\ncarry forward"}
+    ]
     assert any("automatically reset" in msg["content"] for msg in adapter.sent)
     assert any("too large" in msg["content"] for msg in adapter.sent)
 
@@ -995,6 +1000,9 @@ async def test_oversized_session_auto_rotates_on_prompt_tokens(monkeypatch, tmp_
     runner._is_session_run_current = lambda *_args, **_kwargs: True
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._clear_session_env = lambda _tokens: None
+    runner._build_rotation_summary = AsyncMock(
+        return_value="[CONTEXT COMPACTION — REFERENCE ONLY]\ncarry forward"
+    )
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -1026,4 +1034,6 @@ async def test_oversized_session_auto_rotates_on_prompt_tokens(monkeypatch, tmp_
 
     assert result == "ok"
     runner.session_store.reset_session.assert_called_once_with(old_entry.session_key)
-    assert runner._run_agent.await_args.kwargs["history"] == []
+    assert runner._run_agent.await_args.kwargs["history"] == [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION — REFERENCE ONLY]\ncarry forward"}
+    ]
