@@ -517,8 +517,8 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
-    normalized_toolsets = normalized_toolsets or None
+    normalized_enabled_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
+    normalized_enabled_toolsets = normalized_enabled_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -561,7 +561,7 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
-        "enabled_toolsets": normalized_toolsets,
+        "enabled_toolsets": normalized_enabled_toolsets,
         "workdir": normalized_workdir,
     }
 
